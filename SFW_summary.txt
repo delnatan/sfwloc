@@ -1,0 +1,167 @@
+Sliding Frank-Wolfe (SFW) for Gridless Sparse Spike Recovery
+=============================================================
+Summary based on reading cudavenant.py (taken from Bastien Leville's github page). You can see more at: https://github.com/XeBasTeX/SFW-python
+
+THE PROBLEM
+-----------
+You observe a blurry 2D image y(x) on an N x N pixel grid. This image is a
+sum of unknown point sources convolved with a known Gaussian PSF:
+
+  y(x) = sum_i  a_i * h(x - x_i) + noise
+
+where h(x) = exp(-|x|^2 / (2 sigma^2)) / Z is the normalized Gaussian kernel.
+
+You want to recover the number of sources, their positions {x_i} (which are
+NOT restricted to the pixel grid), and their amplitudes {a_i}.
+
+The optimization problem is:
+
+  minimize over m:  T_lambda(m) = lambda * sum|a_i| + 1/2 * ||y - sum_i a_i h(. - x_i)||^2
+
+where m = sum_i a_i * delta(x - x_i) is a discrete measure (a list of
+amplitude-position pairs), and lambda is a regularization parameter that
+controls sparsity.
+
+
+KEY OBJECTS
+-----------
+The measure m:
+  Just a list of (amplitude, position) pairs: {(a_1, x_1), ..., (a_N, x_N)}.
+  Positions x_i are 2D continuous coordinates. Amplitudes a_i are scalars.
+
+The forward operator Phi(m):
+  Evaluates the blurry image predicted by the measure m. Concretely:
+
+    Phi(m)(x) = sum_i a_i * exp(-|x - x_i|^2 / (2 sigma^2)) / Z
+
+  evaluated at every pixel x on the grid. This produces an N x N image.
+
+The adjoint operator Phi*(r):
+  Given a residual image r (also N x N), this computes the cross-correlation
+  of r with the PSF h. Implemented as a 2D convolution (conv2d).
+
+  Intuitively: Phi*(r)(x) tells you how much the residual r "looks like"
+  a point source at location x. Large values mean the residual has energy
+  that matches the PSF shape centered at x.
+
+The certificate eta:
+  eta(x) = (1/lambda) * Phi*(y - Phi(m))
+
+  This is the adjoint applied to the residual, scaled by 1/lambda.
+  Its peak tells you the best location for a new spike. The optimality
+  condition for the problem is |eta(x)| <= 1 everywhere. If this holds,
+  the current measure is already optimal and you can stop.
+
+
+THE ALGORITHM (one iteration)
+-----------------------------
+Start with a measure m_k (initially empty: no spikes).
+
+Step 1: Compute the certificate
+  - Compute the current reconstruction: Phi(m_k) = sum_i a_i h(. - x_i)
+  - Compute the residual: r = y - Phi(m_k)
+  - Correlate residual with PSF: eta = (1/lambda) * conv2d(r, h)
+  - This gives an N x N image eta(x)
+
+Step 2: Find the new spike candidate
+  - x* = pixel location where |eta| is largest
+  - Convert pixel index to continuous coordinate: x* = index / N
+
+Step 3: Check stopping condition
+  - If |eta(x*)| < 1, the current measure satisfies the optimality
+    condition. Stop and return m_k.
+
+Step 4: Convex optimization (amplitudes only, positions fixed)
+  - Append x* to the list of spike positions
+  - Solve for all amplitudes {a_i} with positions fixed:
+
+      minimize over a:  1/2 * ||y - sum_i a_i h(. - x_i)||^2 + lambda * sum|a_i|
+
+  - This is a LASSO problem. The code uses L-BFGS (15 iterations).
+  NOTE: replace this step with FISTA to solve for sparse {a_i}
+
+Step 5: Non-convex optimization (both amplitudes AND positions)
+  - Concatenate all amplitudes and positions into one parameter vector
+  - Optimize with Adam (30 iterations for 'acquis', 80 for 'covar'):
+
+      minimize over (a, x):  1/2 * ||y - sum_i a_i h(. - x_i)||^2 + lambda * sum|a_i|
+
+  - This is the "sliding" part: positions move off the grid to sub-pixel
+    locations via gradient descent through the differentiable Gaussian kernel.
+  - Gradient w.r.t. position x_i flows through:
+      d/dx_i h(x - x_i) = ((x - x_i) / sigma^2) * h(x - x_i)
+
+  For this problem, a block coordinate descent is probably more appropriate where you alternate between two variable groups: first optimize the positions using a good optimizer like L-BFGS, then solve the amplitudes (LASSO problem) with FISTA.
+
+Step 6: Prune
+  - Remove any spike with |a_i| < tolerance (default 1e-4)
+  - This keeps the measure sparse
+
+Step 7: Repeat
+  - Go back to Step 1 with the updated measure
+  - The algorithm also stops early if the number of spikes hasn't changed
+    for 4 consecutive iterations
+
+
+SUMMARY TABLE OF COMPUTATIONS
+------------------------------
+  Forward Phi(m)     For each spike i, evaluate a_i * Gaussian(grid - x_i),
+                     sum over all spikes. Output: N x N image.
+
+  Residual           r = y - Phi(m), pixel-wise subtraction. Output: N x N.
+
+  Adjoint Phi*(r)    Cross-correlate r with the PSF h. One 2D convolution.
+                     Output: N x N image.
+
+  Certificate        eta = Phi*(r) / lambda. Output: N x N image.
+
+  New spike          argmax over pixels of |eta|. Output: one 2D coordinate.
+
+  LASSO              L-BFGS minimizing squared residual + L1 penalty on
+                     amplitudes. Positions frozen. Output: updated amplitudes.
+
+  Sliding            Adam minimizing same objective but now positions are
+                     also free parameters. Output: updated (a, x) pairs.
+
+  Pruning            Delete entries where |a_i| < threshold.
+
+
+NOTE ON THE LASSO STEP (L-BFGS + L1)
+-------------------------------------
+L-BFGS is a smooth optimizer, but the L1 penalty |a| is non-smooth (it has
+a kink at a = 0). The code works around this by letting PyTorch autograd
+compute a subgradient:
+
+  d/da |a| = sign(a)    (with sign(0) = 0 by convention)
+
+L-BFGS then uses these subgradients as if they were true gradients. This is
+a pragmatic hack, not a theoretically sound procedure:
+
+  - L-BFGS builds a curvature model from gradient history. At the kink a = 0,
+    the gradient jumps discontinuously, which can confuse the curvature estimate.
+  - L-BFGS will rarely land exactly at a_i = 0, so it won't produce truly
+    sparse solutions. That's why prune() is needed afterward.
+  - It works "well enough" because this step only provides an initialization
+    for the subsequent non-convex Adam step.
+
+The principled approach would be proximal gradient descent, alternating:
+  1. Gradient step on the smooth part:  a <- a - step * gradient(||y - Phi(m)||^2)
+  2. Proximal step (soft-thresholding):  a <- sign(a) * max(|a| - lambda * step, 0)
+
+The soft-thresholding operator is what drives amplitudes exactly to zero.
+
+
+COVARIANCE VARIANT
+------------------
+The code also supports obj='covar', where instead of matching the mean image
+y directly, you match the empirical covariance matrix R_y. In that case:
+
+  - The forward operator Lambda(m) produces an N^2 x N^2 covariance matrix:
+      Lambda(m) = sum_i a_i * vec(h_i) * vec(h_i)^T
+    where h_i is the PSF centered at x_i, and vec() flattens it to a vector.
+
+  - The adjoint is adapted accordingly (uses h^2 in the convolution).
+
+  - This is useful for fluorescence microscopy where you observe a time-stack
+    of images with random blinking, and the covariance carries information
+    about individual source locations that the mean does not.
