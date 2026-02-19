@@ -60,13 +60,13 @@ def poisson_nll(model, y):
     return mx.sum(model - y * mx.log(model + EPS))
 
 
-def compute_certificate(y, model_img, sigma, lam, grid_y, grid_x):
-    """Dual certificate eta = (1/lam) * Phi^*(1 - y/model).
+def compute_certificate(y, model_img, sigma, grid_y, grid_x):
+    """Source-selection map eta = Phi^*(1 - y/model).
 
     Uses mx.conv2d with the PSF kernel (symmetric, so no flip needed) to
     compute the adjoint operator.
 
-    Returns (H, W) certificate image.
+    Returns (H, W) source-selection map.
     """
     w = 1.0 - y / (model_img + EPS)  # (H, W) weighted residual
 
@@ -88,14 +88,15 @@ def compute_certificate(y, model_img, sigma, lam, grid_y, grid_x):
     adj = mx.conv2d(w_4d, k_4d, padding=pad)  # (1, H, W, 1)
     adj = adj[0, :H, :W, 0]
 
-    return adj / lam
+    return adj
 
 
 def find_new_spike(eta):
     """Find pixel location with most negative eta (strongest certificate violation).
 
-    For Poisson NLL + non-negative L1: adding a spike is beneficial when
-    eta(x) < -1.  We find argmin(eta) and return (position, min_val).
+    In positive BLASSO mode, a new source is beneficial when the minimum
+    certificate value is below the active threshold (-lam). We return
+    argmin(eta) and the minimum value.
     """
     flat_idx = mx.argmin(eta.reshape(-1))
     mx.eval(flat_idx)
@@ -104,3 +105,67 @@ def find_new_spike(eta):
     row, col = idx // W, idx % W
     min_val = eta.reshape(-1)[flat_idx]
     return mx.array([[float(row), float(col)]]), min_val
+
+
+def refine_new_spike(
+    init_pos,
+    y,
+    model_img,
+    sigma,
+    grid_y,
+    grid_x,
+    n_steps=25,
+    step0=1.0,
+):
+    """Refine a coarse source location by continuous local search.
+
+    Starting from init_pos (typically the best certificate pixel), minimize the
+    continuous certificate value
+
+        eta(theta) = <psi(theta), 1 - y/model>
+
+    using projected gradient descent with backtracking.
+
+    Returns
+    -------
+    pos : (1, 2) refined position
+    eta_val : scalar certificate value at refined position
+    """
+    H, W = y.shape
+    lower = mx.array([0.0, 0.0], dtype=mx.float32)
+    upper = mx.array([float(H - 1), float(W - 1)], dtype=mx.float32)
+    pos = init_pos.reshape(2)
+    w = 1.0 - y / (model_img + EPS)
+
+    def eta_of_pos(p):
+        dy = grid_y - p[0]
+        dx = grid_x - p[1]
+        psf = mx.exp(-(dy * dy + dx * dx) / (2.0 * sigma * sigma))
+        psf = psf / (mx.sum(psf) + EPS)
+        return mx.sum(w * psf)
+
+    for _ in range(n_steps):
+        val, grad = mx.value_and_grad(eta_of_pos)(pos)
+        mx.eval(val, grad)
+        gnorm = float(mx.sqrt(mx.sum(grad * grad)).item())
+        if gnorm < 1e-6:
+            break
+
+        step = step0
+        improved = False
+        for _ls in range(12):
+            cand = mx.clip(pos - step * grad, lower, upper)
+            cand_val = eta_of_pos(cand)
+            mx.eval(cand_val)
+            if cand_val.item() < val.item():
+                pos = cand
+                improved = True
+                break
+            step *= 0.5
+
+        if not improved:
+            break
+
+    final_val = eta_of_pos(pos)
+    mx.eval(final_val)
+    return pos[None, :], final_val

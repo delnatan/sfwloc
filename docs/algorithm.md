@@ -17,19 +17,19 @@ where `h(x) = exp(−|x|² / (2σ²)) / Z` is the normalized Gaussian kernel.
 The goal is to recover the number of sources, their positions `{xᵢ}` (which
 are **not** restricted to the pixel grid), and their amplitudes `{aᵢ}`.
 
-The optimization problem is:
+The optimization problem used here is:
 
 ```
-minimize over m:  T_λ(m) = λ · Σ|aᵢ| + ½ · ‖y − Σᵢ aᵢ h(· − xᵢ)‖²
+minimize over a, x:  PoissonNLL(Σᵢ aᵢ h(· − xᵢ) + bg, y) + λ Σᵢ aᵢ
+subject to          aᵢ ≥ 0
 ```
 
 where `m = Σᵢ aᵢ δ(x − xᵢ)` is a discrete measure (a list of
-amplitude–position pairs), and `λ` is a regularization parameter controlling
-sparsity.
+amplitude–position pairs), and `λ` controls sparsity/complexity.
 
-**This implementation** replaces the L1 penalty with an MCP (Minimax Concave
-Penalty) and uses a Poisson negative log-likelihood instead of the squared
-residual, making it appropriate for photon-counting fluorescence microscopy.
+**This implementation** uses a Poisson negative log-likelihood with a
+non-negative L1 amplitude step (proximal/FISTA), plus local bounded
+Levenberg-Marquardt refinement of support locations.
 
 ---
 
@@ -51,10 +51,10 @@ source at location `x`.
 
 **Certificate η** — the dual variable for optimality testing:
 ```
-η(x) = (1/λ) · Φ*(1 − y / model)
+η(x) = Φ*(1 − y / model)
 ```
-The optimality condition is `η(x) ≥ −1` everywhere. If this holds, the
-current measure is optimal and the algorithm stops.
+In nonnegative BLASSO mode, one adds spikes while `min_x η(x) < -λ`
+(equivalently `-min_x η(x)/λ > 1`).
 
 ---
 
@@ -62,64 +62,46 @@ current measure is optimal and the algorithm stops.
 
 Start with a measure `mₖ` (initially empty).
 
-1. **Certificate** — compute `η = (1/λ) Φ*(1 − y/model)` and find `x* = argmin η`.
+1. **Source selection** — compute `η = Φ*(1 − y/model)`, take the
+   best grid point, then run local continuous refinement from that start.
 
-2. **Check stopping** — if `min(η) ≥ −1`, the measure is optimal. Stop.
+2. **Check stopping** — stop when the certificate condition is met.
 
 3. **Add spike** — append `x*` with amplitude 1.0 to the measure.
 
-4. **FISTA** — optimize all amplitudes with positions frozen, using the MCP
-   penalty (non-convex, reduces L1 bias for bright emitters).
+4. **Projected FISTA** — optimize amplitudes with positions frozen under
+   `a >= 0` with L1 penalty `λ * sum(a)`.
 
-5. **Levenberg-Marquardt refinement** — alternating block-coordinate LM:
-   - LM on amplitudes (positions fixed, Coleman-Li box constraints)
-   - LM on positions (amplitudes fixed, optional pairwise Gaussian repulsion)
+5. **Local descent** — bounded joint Levenberg-Marquardt on amplitudes and
+   positions (Coleman-Li box constraints).
 
-6. **Prune** — remove emitters with amplitude below `S_min`.
+6. **Prune** — remove emitters with near-zero amplitude (`prune_tol`).
 
-7. **Repeat** — or stop early if emitter count is stable for 4 iterations.
-
----
-
-## Super-resolved (Crowded) Mode
-
-When emitters are separated by less than ~2σ, the standard solver merges
-nearby pairs into a single over-bright spike. Two complementary parameters
-address this:
-
-**`amp_cap`** — amplitude ceiling applied after every FISTA step.
-Limits per-emitter flux, leaving structured residual so the certificate can
-propose a second nearby atom. The certificate exclusion zone is automatically
-tightened from 1σ to 0.5σ when `amp_cap` is active.
-
-Rule of thumb: `amp_cap ≈ 0.5 × A_max`
-
-**`rep_strength`** — Gaussian pairwise repulsion added to the LM position
-objective:
-```
-R = Σᵢ<ⱼ exp(−dᵢⱼ² / (2σ²))
-```
-Prevents LM from collapsing two nearby atoms back to their centroid.
-
-Rule of thumb: `rep_strength ≈ 0.1–0.2 × A_single`
-
-Both parameters are needed: `amp_cap` creates the residual; `rep_strength`
-keeps the proposed atoms separated.
+7. **Repeat** until the certificate condition is satisfied or `n_iter` is reached.
 
 ---
 
-## MCP Penalty
+## Amplitude Step
 
-The Minimax Concave Penalty (MCP) is used instead of L1 to recover unbiased
-amplitude estimates above a threshold:
+Given current support, amplitudes are updated by solving:
 
 ```
-p(a; λ, γ) = λa − a²/(2γ)   for 0 ≤ a ≤ γλ
-           = γλ²/2           for a > γλ
+minimize_a  PoissonNLL(Ha + bg, y) + λ * sum(a)
+subject to  a >= 0
 ```
+This uses positive soft-threshold proximal steps (monotone FISTA).
 
-The shape parameter `γ = S_min / λ`. Amplitudes above `S_min` are recovered
-without bias; those below are driven to zero and pruned.
+## Lam Continuation
+
+For crowded scenes, use `lam_schedule=[lam_1, lam_2, ..., lam_S]` with
+`lam_1 >= ... >= lam_S`:
+
+1. Run SFW at `lam_1` from empty support.
+2. Warm-start the next stage at `lam_2` from the previous stage solution.
+3. Continue until `lam_S`.
+
+This often reduces over-spawning early while still allowing support splitting
+at the final, lower-regularized stage.
 
 ---
 
